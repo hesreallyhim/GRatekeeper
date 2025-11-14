@@ -1,10 +1,46 @@
 # GRatekeeper
 
-Gratekeeper is a tiny helper for personal scripts that talk to the GitHub REST
-API. It wraps `requests` with a local rate keeper that watches the
-`X-RateLimit-*` headers GitHub already returns and sleeps before the bucket is
-fully depleted. This keeps you on the safe side of the per-authentication
-limits without waiting for a 403 first.
+Gratekeeper is a lightweight observability and throttling layer for GitHub.
+Think of it as “one terminal pane” that gives you:
+
+1. Real-time visibility into every rate-limit bucket across your account, plus
+   GitHub Actions activity and billing minutes.
+2. An optional REST client wrapper that slows your scripts down **before** you
+   smack into the rate ceiling, so you can fire off aggressive workflows without
+   retry storms or secondary-limit penalties.
+
+The dashboard stays live when you are busy and gracefully falls back to periodic
+polling when things calm down, so you always know what shape your quota is in.
+
+```mermaid
+flowchart LR
+    subgraph Scripts
+        A[Your jobs] -->|requests| B(RateLimitedGitHubClient)
+        B -->|callbacks| D(Listener hooks)
+    end
+    B -->|HTTP| G[(GitHub API)]
+    G -->|X-RateLimit headers| B
+    G -->|/rate_limit| C(RateLimitDashboard)
+    C -->|live view| E{Terminal UI}
+    C -->|workflow runs + billing| G
+```
+
+## Highlights
+
+- **Always-on observability:** `gratekeeper-dashboard` keeps every quota bucket,
+  workflow run queue, and billing minute in one table with keyboard shortcuts
+  for faster/slower redraws and an optional tmux split.
+- **Opt-in throttling:** `RateLimitedGitHubClient` wraps `requests.Session`,
+  automatically loads `GITHUB_TOKEN`, and exposes both raw responses and JSON
+  helpers. Drop it into scripts you want to protect; keep using plain `requests`
+  everywhere else.
+- **Soft-floor rate keeping:** `LocalRateKeeper` watches the latest
+  `X-RateLimit-*` headers, applies a configurable soft floor, and sleeps before
+  you burn through a bucket, even when other apps share the same token.
+- **Background refresh + listeners:** the client can poll `GET /rate_limit` when
+  idle, and external listeners get a callback whenever fresh headers arrive.
+- **Rich logging:** color-coded log lines highlight successful calls, 4xx/5xx
+  responses, proactive sleeps, and true rate-limit hits.
 
 ## Installation
 
@@ -12,15 +48,22 @@ limits without waiting for a 403 first.
 pip install gratekeeper
 ```
 
-The package pulls in `requests` and supports Python 3.10+.
+- Requires Python 3.10+ and installs the `gratekeeper-dashboard` entrypoint.
+- Dependencies: `requests` for HTTP and `rich` for the terminal UI/logging.
 
 For local development (tests, typing, linters):
 
 ```bash
 pip install -e .[dev]
+pytest
 ```
 
-## Quick start
+`pip install -e .[dev]` pulls in `pytest` and type stubs; run `python -m unittest`
+if you prefer the built-in test discovery.
+
+## Usage
+
+### Quick start
 
 ```python
 from gratekeeper import RateLimitedGitHubClient
@@ -30,107 +73,127 @@ me = client.get_json("/user")
 print(me["login"])
 ```
 
-### Authentication
-
-- `GITHUB_TOKEN` is loaded automatically.
-- You can also pass `token="ghp_..."` when constructing the client.
-- Requests always send `Accept: application/vnd.github+json` and a simple
-  `User-Agent`.
-
-### Throttling behavior
-
-The bundled `LocalRateKeeper` maintains the last seen `limit`,
-`remaining`, and `reset` timestamp. Before each request it:
-
-1. Clears its counters if the reset time has passed.
-2. Computes a **soft floor** (default: 20% of the limit, minimum 10 requests).
-3. Sleeps until the reset window plus a small safety buffer if `remaining`
-   is already below that floor.
-4. Otherwise, decrements its local `remaining` estimate and allows the
-   request to proceed.
-
-This keeps a healthy margin even if other tools consume the shared quota.
-
-### Inspecting the budget
-
-Call `client.rate_limit_snapshot()` to read the last known state:
+### Customize requests
 
 ```python
-state = client.rate_limit_snapshot()
+client = RateLimitedGitHubClient(
+    token="ghp_example",                  # or rely on $GITHUB_TOKEN
+    base_url="https://github.myco.com/api/v3/",
+    user_agent="my-script/1.0",
+    timeout=30.0,
+)
+client.get("/orgs/my-org/repos", params={"per_page": "100"})
+```
+
+- Set `enable_ratekeeping=False` if you need a raw client temporarily.
+- Pass a custom `requests.Session` or `LocalRateKeeper` if you already manage
+  those objects.
+- `bucket="search"` or any other label lets the rate keeper track independent
+  quotas while sharing a single client.
+- GraphQL support is on deck. GitHub exposes rate-limit feedback in the
+  response headers for GraphQL just like REST, so the rate keeper already has
+  the data it needs. Once POST helpers land you will be able to call the GraphQL
+  endpoint without any extra throttling configuration.
+- The current helper issues `GET` requests only. That matches the original
+  “read-mostly” use case, but the throttling logic itself is transport-agnostic;
+  once POST/GraphQL helpers are added they will share the same safeguards.
+
+### Rate-limit design
+
+`LocalRateKeeper` is intentionally simple:
+
+1. Every bucket caches `limit`, `remaining`, and `reset_ts`.
+2. Before each request it clears expired windows, computes a soft floor
+   (`limit * 0.2`, minimum 10 requests by default), and sleeps until the reset
+   time plus a safety buffer whenever `remaining` dips below that floor.
+3. Otherwise it decrements the local counter and lets the call proceed.
+
+This keeps scripts responsive while avoiding accidental 403s even when the token
+is shared with other tooling.
+
+### Observability and listeners
+
+Use snapshots for simple logging or monitoring:
+
+```python
+state = client.rate_limit_snapshot("core")
 print(state.limit, state.remaining, state.reset_ts)
 ```
 
-## Realtime dashboard
+For richer integrations register listeners that receive updates whenever headers
+change:
 
-Gratekeeper ships with a tiny Rich-powered TUI that watches `GET /rate_limit`
-and shows each quota bucket updating in realtime. Provide a GitHub token via
-`--token` or `GITHUB_TOKEN` and run:
+```python
+def handle_update(bucket, state):
+    print(f"{bucket} remaining: {state.remaining}")
 
-```bash
-python -m gratekeeper.dashboard --refresh 1 --fetch 15 --actions owner/repo
-# or use the installed entry point
-gratekeeper-dashboard --refresh 1 --fetch 15 --actions owner/repo
-# tmux users can spawn it in a split pane automatically
-gratekeeper-dashboard --tmux-pane --refresh 1 --fetch 15 --actions owner/repo
+client.add_rate_limit_listener(handle_update)
+# ... later
+client.remove_rate_limit_listener(handle_update)
 ```
 
-- `--refresh` (default: 60s) controls how often the UI redraws.
-- `--fetch` (default: 60s) is the fallback polling interval used only when no
-  live updates have been observed recently.
-- Pass `--buckets core search` to restrict the table to specific resources.
-- Provide `--actions owner/repo another/repo` to include GitHub Actions stats for
-  specific repositories, and add `--actions-billing-user` or
-  `--actions-billing-org my-org` if you want to see consumed minutes.
-- Inside the dashboard: press `u` to speed up redraws, `d` to slow down, and `r`
-  to request an immediate refresh.
-- Add `--tmux-pane` to attempt launching the dashboard in a new tmux split (it
-  quietly does nothing when tmux isn’t available).
+### Background polling
 
-Press `Ctrl+C` to exit.
+Stay in sync when other apps consume API quota:
 
-When you instantiate `RateLimitDashboard` inside a script that already uses
-`RateLimitedGitHubClient`, the dashboard subscribes to the client's internal
-rate-limit updates so each request instantly updates the table. If no requests
-have fired for roughly a minute, the dashboard automatically calls
-`GET /rate_limit` once to stay fresh.
+```python
+client.start_rate_limit_polling(interval_seconds=90, bucket="core")
+# ...
+client.stop_rate_limit_polling()
+```
+
+The poller reuses the same client, calls `GET /rate_limit`, and automatically
+backs off whenever normal requests provide fresh headers.
+
+## Realtime dashboard
+
+`gratekeeper-dashboard` is a Rich TUI that watches `GET /rate_limit`, displays
+each bucket, and optionally tracks GitHub Actions activity.
+
+```bash
+# basic view
+gratekeeper-dashboard --refresh 10 --fetch 60
+
+# include GitHub Actions data
+gratekeeper-dashboard --actions my-org/service another/repo \
+  --actions-billing-user --actions-billing-org my-org
+```
+
+- Provide `--token` or rely on `GITHUB_TOKEN`. `--base-url` works with GHES.
+- `--buckets core search` limits the table to specific quotas.
+- Actions integration shows in-progress/queued workflow runs per repo plus
+  billing minutes for the authenticated user or an organization.
+- Keybindings: `u` speeds up redraws, `d` slows them down, `r` triggers an
+  immediate fetch, `Ctrl+C` exits.
+- `--fetch` controls how often the dashboard polls when the client has been
+  idle; real API calls instantly update the table through rate-limit listeners.
+- `--tmux-pane` attempts to spawn the dashboard in a 40% vertical split when
+  running inside tmux. Outside tmux it quietly falls back to normal behavior.
+
+Embedding the dashboard inside an existing script is just a matter of creating a
+`RateLimitDashboard` with your existing `RateLimitedGitHubClient`. The dashboard
+subscribes to the client’s listener API, so every request immediately refreshes
+the table, and idle periods fall back to an occasional `GET /rate_limit`.
+
+VHS-powered demos and a richer visual walkthrough are on the way to showcase the
+TUI experience without cloning the repo first.
+
+## Logging
+
+Importing Gratekeeper attaches a Rich `RichHandler` to the `gratekeeper` logger
+(unless you already configured handlers). Successful requests log in green,
+standard 4xx errors in yellow, and rate-limit hits or forced sleeps in bold red
+or yellow so you can see issues at a glance. Configure your own logger before
+importing Gratekeeper if you want different styling.
 
 ## Testing
 
 ```bash
 pip install -e .[dev]
+pytest
+# or
 python -m unittest discover -s tests -t .
 ```
 
-## Logging
-
-Gratekeeper ships with [Rich](https://github.com/Textualize/rich) and attaches a
-`RichHandler` to the `gratekeeper` logger automatically (unless you already have
-handlers configured).
-
-- Green lines for successful requests.
-- Yellow lines for other 4xx responses.
-- Bold red lines for rate-limit hits (429 or 403 with `X-RateLimit-Remaining: 0`).
-- Bold yellow warnings when the rate keeper pauses before the reset window.
-
-If you want a different style, configure the logger yourself before importing
-Gratekeeper or remove the provided handler and attach your own.
-
-## Background polling
-
-To stay in sync when other tools consume the same GitHub rate limit, you can ask
-the client to poll `GET /rate_limit` in the background:
-
-```python
-client.start_rate_limit_polling(interval_seconds=60)
-# ...
-client.stop_rate_limit_polling()
-```
-
-Whenever a normal request returns fresh `X-RateLimit-*` headers, the poller’s
-timer resets so periodic calls do not pile up unnecessarily.
-
-## Roadmap
-
-This branch focuses on a simple GET-only helper. Future iterations may add
-POST/PUT helpers, richer configuration, or a small dashboard, but the primary
-goal remains “keep my scripts from tripping the rate limiter.”*** End Patch
+The repository keeps tests, typing, and lint helpers under the `dev` extra so
+the published wheel stays lean.

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gratekeeper"
+version = "0.2.0"
+description = "Gratekeeper is a lightweight GitHub REST helper with proactive rate-limit throttling."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "rich>=13.7.0",
+]
+authors = [{ name = "Really Him", email = "hesreallyhim@proton.me" }]
+license = { text = "MIT" }
+
+[project.scripts]
+gratekeeper-dashboard = "gratekeeper.dashboard:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "types-requests>=2.31.0.10",
+]
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gratekeeper"]

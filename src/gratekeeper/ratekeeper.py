@@ -26,7 +26,7 @@ class BucketState:
     reset_ts: Optional[int] = None  # UNIX timestamp (UTC seconds)
 
 
-class LocalRateKeeper:
+class LocalGratekeeper:
     """Tracks GitHub rate-limit headers locally and sleeps before exhaustion."""
 
     def __init__(
@@ -70,7 +70,9 @@ class LocalRateKeeper:
             if state.limit is None or state.remaining is None:
                 return
 
-            soft_floor = max(int(state.limit * self.soft_floor_fraction), self.soft_floor_min)
+            soft_floor = max(
+                int(state.limit * self.soft_floor_fraction), self.soft_floor_min
+            )
 
             if (
                 state.remaining <= soft_floor
@@ -83,7 +85,12 @@ class LocalRateKeeper:
                 state.remaining -= 1
 
         if sleep_for and sleep_for > 0:
-            bucket_name, remaining, floor, reset_ts = sleep_context or (bucket, None, 0, None)
+            bucket_name, remaining, floor, reset_ts = sleep_context or (
+                bucket,
+                None,
+                0,
+                None,
+            )
             message = (
                 f"Rate limit low for bucket '{bucket_name}': remaining={remaining} "
                 f"floor={floor} reset_ts={reset_ts}. Sleeping {sleep_for:.1f}s."

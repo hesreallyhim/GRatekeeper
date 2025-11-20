@@ -19,7 +19,9 @@ except ImportError:  # pragma: no cover
     _escape = _noop_escape
 else:
     RICH_AVAILABLE = True
-    _RichHandler = cast(Callable[..., logging.Handler], getattr(rich_logging, "RichHandler"))
+    _RichHandler = cast(
+        Callable[..., logging.Handler], getattr(rich_logging, "RichHandler")
+    )
     _escape = cast(Callable[[str], str], getattr(rich_markup, "escape"))
 
 

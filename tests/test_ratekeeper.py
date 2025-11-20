@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from gratekeeper.ratekeeper import LocalRateKeeper  # type: ignore[import-not-found]
+from gratekeeper.ratekeeper import LocalGratekeeper  # type: ignore[import-not-found]
 
 
-class LocalRateKeeperTests(unittest.TestCase):
+class LocalGratekeeperTests(unittest.TestCase):
     def test_after_response_updates_state(self) -> None:
-        keeper = LocalRateKeeper(now_fn=lambda: 0)
+        keeper = LocalGratekeeper(now_fn=lambda: 0)
         headers = {
             "X-RateLimit-Limit": "5000",
             "X-RateLimit-Remaining": "4500",
@@ -22,7 +22,7 @@ class LocalRateKeeperTests(unittest.TestCase):
         self.assertEqual(state.reset_ts, 1234567890)
 
     def test_before_request_decrements_remaining(self) -> None:
-        keeper = LocalRateKeeper(now_fn=lambda: 0)
+        keeper = LocalGratekeeper(now_fn=lambda: 0)
         keeper.after_response(
             {
                 "X-RateLimit-Limit": "100",
@@ -37,7 +37,7 @@ class LocalRateKeeperTests(unittest.TestCase):
 
     def test_before_request_sleeps_when_under_floor(self) -> None:
         sleep_calls: list[float] = []
-        keeper = LocalRateKeeper(
+        keeper = LocalGratekeeper(
             soft_floor_fraction=0.5,
             soft_floor_min=1,
             safety_buffer_seconds=3,

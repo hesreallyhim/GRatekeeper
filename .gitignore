@@ -131,3 +131,5 @@ temp/
 *.orig
 
 .python-version
+.stamps/
+

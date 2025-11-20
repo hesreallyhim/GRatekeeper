@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import select
 import shlex
@@ -21,6 +22,9 @@ from rich.text import Text
 
 from .client import RateLimitedGitHubClient
 from .ratekeeper import BucketState
+from .bridge import DEFAULT_SOCKET_PATH
+
+logger = logging.getLogger("gratekeeper.dashboard")
 
 try:  # pragma: no cover - platform dependent
     import termios
@@ -95,6 +99,12 @@ class RateLimitDashboard:
         self._actions_repos = tuple(actions_repos) if actions_repos else tuple()
         self._actions_billing_user = actions_billing_user
         self._actions_billing_org = actions_billing_org
+        if self._actions_billing_user or self._actions_billing_org:
+            logger.info(
+                "Actions billing display enabled (user=%s, org=%s)",
+                self._actions_billing_user,
+                self._actions_billing_org,
+            )
         self._lock = threading.Lock()
         self._resources: MutableMapping[str, RateLimitResource] = {}
         self._last_fetch_error: Optional[str] = None
@@ -105,6 +115,7 @@ class RateLimitDashboard:
         self._actions_billing: MutableMapping[str, ActionsBillingStatus] = {}
         self._last_actions_fetch_ts: Optional[float] = None
         self._manual_fetch_event = threading.Event()
+        self._wakeup_event = threading.Event()
         self._input_stop_event = threading.Event()
         self._input_thread: Optional[threading.Thread] = None
         self._min_refresh_interval = 0.5
@@ -122,7 +133,10 @@ class RateLimitDashboard:
                 screen=False,
             ) as live:
                 try:
+                    next_refresh = 0.0
                     while True:
+                        if next_refresh:
+                            self._wait_for_next_iteration(next_refresh)
                         force_fetch = self._manual_fetch_event.is_set()
                         if force_fetch:
                             self._manual_fetch_event.clear()
@@ -130,7 +144,7 @@ class RateLimitDashboard:
                             self._maybe_fetch(force=force_fetch)
                         live.refresh_per_second = self._refresh_rate_value()
                         live.update(self._render_panel(), refresh=force_fetch)
-                        time.sleep(self._current_refresh_interval())
+                        next_refresh = time.time() + self._current_refresh_interval()
                 except KeyboardInterrupt:
                     pass
         finally:
@@ -144,6 +158,7 @@ class RateLimitDashboard:
             self._last_update_ts = time.time()
             self._last_update_source = "client"
             self._last_fetch_error = None
+        self._trigger_wakeup()
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -255,7 +270,8 @@ class RateLimitDashboard:
         )
         subtitle.append("  •  Press Ctrl+C to exit")
         subtitle.append(
-            f"\nControls: u faster, d slower, r refresh (current {self._current_refresh_interval():.1f}s)"
+            "\nControls: u faster, d slower, r refresh "
+            f"(current {self._current_refresh_interval():.1f}s)"
         )
         return subtitle
 
@@ -330,10 +346,8 @@ class RateLimitDashboard:
                 billing[billing_status.scope] = billing_status
 
         with self._lock:
-            if statuses:
-                self._actions_status = statuses
-            if billing:
-                self._actions_billing = billing
+            self._actions_status = statuses
+            self._actions_billing = billing
             self._last_actions_fetch_ts = now
 
     def _fetch_actions_repo(self, repo: str) -> Optional[ActionsRepoStatus]:
@@ -445,10 +459,15 @@ class RateLimitDashboard:
         key = key.lower()
         if key == "u":
             self._adjust_refresh_speed(faster=True)
+            self._manual_fetch_event.set()
+            self._trigger_wakeup()
         elif key == "d":
             self._adjust_refresh_speed(faster=False)
+            self._manual_fetch_event.set()
+            self._trigger_wakeup()
         elif key == "r":
             self._manual_fetch_event.set()
+            self._trigger_wakeup()
 
     def _adjust_refresh_speed(self, *, faster: bool) -> None:
         with self._lock:
@@ -468,6 +487,19 @@ class RateLimitDashboard:
         if interval <= 0:
             return 5.0
         return max(1.0 / interval, 0.2)
+
+    def _wait_for_next_iteration(self, deadline: float) -> None:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            triggered = self._wakeup_event.wait(timeout=remaining)
+            if triggered:
+                self._wakeup_event.clear()
+                return
+
+    def _trigger_wakeup(self) -> None:
+        self._wakeup_event.set()
 
 
 def _fmt_int(value: Optional[int]) -> str:
@@ -542,6 +574,7 @@ def _safe_int(value: object) -> Optional[int]:
             return None
     return None
 
+
 def _launch_in_tmux(argv: list[str]) -> bool:
     if shutil.which("tmux") is None:
         return False
@@ -608,29 +641,77 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--actions-billing-org",
         help="Display GitHub Actions billing minutes for the given organization",
     )
+    parser.add_argument(
+        "--killswitch-seconds",
+        type=float,
+        help="Stop sending requests after this many seconds (fails closed).",
+    )
+    parser.add_argument(
+        "--killswitch-reason",
+        help="Optional note logged when the killswitch activates.",
+    )
+    parser.add_argument(
+        "--ui",
+        choices=["textual", "table"],
+        default="textual",
+        help="Choose between the new Textual dashboard or the legacy table view.",
+    )
+    parser.add_argument(
+        "--socket",
+        default=None,
+        help="Unix socket path for external rate-limit updates (default: $GRATEKEEPER_SOCKET or /tmp/gratekeeper.sock). Set to 'none' to disable.",
+    )
     args = parser.parse_args(argv)
 
     if args.tmux_pane:
-        _launch_in_tmux(argv)
-        return 0
+        if _launch_in_tmux(argv):
+            return 0
+        print(
+            "--tmux-pane requires running inside an existing tmux session. "
+            "Re-run without the flag.",
+            file=sys.stderr,
+        )
+        return 1
 
     client_kwargs = {}
     if args.token:
         client_kwargs["token"] = args.token
     if args.base_url:
         client_kwargs["base_url"] = args.base_url
+    socket_path = args.socket
+    if socket_path is None:
+        socket_path = os.getenv("GRATEKEEPER_SOCKET", DEFAULT_SOCKET_PATH)
 
     client = RateLimitedGitHubClient(**client_kwargs)
-    dashboard = RateLimitDashboard(
-        client,
-        buckets=args.buckets,
-        refresh_interval=args.refresh,
-        fetch_interval=args.fetch,
-        actions_repos=args.actions,
-        actions_billing_user=args.actions_billing_user,
-        actions_billing_org=args.actions_billing_org,
-    )
+    if args.killswitch_seconds is not None:
+        client.schedule_killswitch(
+            after_seconds=max(args.killswitch_seconds, 0),
+            reason=args.killswitch_reason,
+        )
     try:
+        if args.ui == "textual":
+            from .textual_dashboard import run_textual_dashboard
+
+            return run_textual_dashboard(
+                client,
+                buckets=args.buckets,
+                refresh_interval=args.refresh,
+                fetch_interval=args.fetch,
+                actions_repos=args.actions,
+                actions_billing_user=args.actions_billing_user,
+                actions_billing_org=args.actions_billing_org,
+                socket_path=socket_path,
+            )
+
+        dashboard = RateLimitDashboard(
+            client,
+            buckets=args.buckets,
+            refresh_interval=args.refresh,
+            fetch_interval=args.fetch,
+            actions_repos=args.actions,
+            actions_billing_user=args.actions_billing_user,
+            actions_billing_org=args.actions_billing_org,
+        )
         dashboard.run()
     finally:
         client.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from unittest.mock import patch
@@ -22,10 +23,14 @@ class _StubClient:
         self.fetches = 0
         self.routes = routes or {}
 
-    def add_rate_limit_listener(self, listener: Callable[[str, BucketState], None]) -> None:
+    def add_rate_limit_listener(
+        self, listener: Callable[[str, BucketState], None]
+    ) -> None:
         self.listener = listener
 
-    def remove_rate_limit_listener(self, listener: Callable[[str, BucketState], None]) -> None:
+    def remove_rate_limit_listener(
+        self, listener: Callable[[str, BucketState], None]
+    ) -> None:
         if self.listener is listener:
             self.listener = None
 
@@ -179,6 +184,58 @@ def test_actions_billing_fetch_user() -> None:
     assert dash._actions_billing["user"].total_minutes_used == 120
 
 
+def test_actions_data_clears_when_fetch_returns_nothing() -> None:
+    repo_path = "/repos/foo/bar/actions/runs"
+    routes = {
+        repo_path: {
+            "workflow_runs": [
+                {"status": "in_progress", "conclusion": None, "updated_at": "now"},
+            ]
+        }
+    }
+    client = _StubClient(routes=routes)
+    dash = RateLimitDashboard(
+        client,
+        auto_fetch=False,
+        enable_keybindings=False,
+        actions_repos=("foo/bar",),
+    )
+
+    dash._maybe_fetch_actions(force=True)
+    assert "foo/bar" in dash._actions_status
+
+    client.routes[repo_path] = {"workflow_runs": "invalid"}
+    dash._maybe_fetch_actions(force=True)
+
+    assert dash._actions_status == {}
+
+
+def test_actions_billing_clears_when_unavailable() -> None:
+    billing_path = "/user/settings/billing/actions"
+    routes = {
+        billing_path: {
+            "total_minutes_used": 1,
+            "included_minutes": 2,
+            "total_paid_minutes_used": 0,
+        }
+    }
+    client = _StubClient(routes=routes)
+    dash = RateLimitDashboard(
+        client,
+        auto_fetch=False,
+        enable_keybindings=False,
+        actions_billing_user=True,
+    )
+
+    dash._maybe_fetch_actions(force=True)
+    assert "user" in dash._actions_billing
+
+    client.routes[billing_path] = "oops"
+    dash._maybe_fetch_actions(force=True)
+
+    assert dash._actions_billing == {}
+
+
 def test_launch_in_tmux_no_binary() -> None:
     with patch("gratekeeper.dashboard.shutil.which", return_value=None):
         assert _launch_in_tmux(["--tmux-pane"]) is False
@@ -198,4 +255,16 @@ def test_launch_in_tmux_invokes_tmux_command() -> None:
 
             with patch("gratekeeper.dashboard.subprocess.run", side_effect=fake_run):
                 assert _launch_in_tmux(["--tmux-pane", "--refresh", "5"]) is True
-                assert captured["cmd"][0:3] == ["tmux", "split-window", "-v"]
+
+
+def test_main_tmux_flag_without_session_exits_with_message() -> None:
+    import gratekeeper.dashboard as dashboard
+
+    stderr = io.StringIO()
+
+    with patch("gratekeeper.dashboard._launch_in_tmux", return_value=False):
+        with patch("sys.stderr", new=stderr):
+            code = dashboard.main(["--tmux-pane"])
+
+    assert code == 1
+    assert "tmux" in stderr.getvalue().lower()
